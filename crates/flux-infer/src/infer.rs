@@ -995,6 +995,9 @@ impl<'a, E: LocEnv> Sub<'a, E> {
 
                 Ok(())
             }
+            (BaseTy::Alias(AliasKind::Opaque, alias_ty_b), _) => {
+                self.handle_opaque_type(infcx, b, alias_ty_b)
+            }
             (_, BaseTy::Alias(AliasKind::Opaque, alias_ty_b)) => {
                 // only for when concrete type on LHS and impl-with-bounds on RHS
                 self.handle_opaque_type(infcx, a, alias_ty_b)

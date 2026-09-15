@@ -41,6 +41,9 @@ pub mod convert;
 #[cfg(any(flux, doc))]
 pub mod alloc;
 
+#[cfg(any(flux, doc))]
+pub mod cell;
+
 // -------------------------------------------------------------------
 
 #[macro_export]

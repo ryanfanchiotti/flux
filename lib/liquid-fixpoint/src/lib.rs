@@ -253,7 +253,8 @@ pub enum FixpointStatus<Tag> {
 pub enum LeanStatus {
     #[default]
     Invalid,
-    Valid,
+    /// The proof was checked when the user-written lean files had the given digest.
+    Valid(u64),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -461,6 +462,8 @@ pub enum ThyFunc {
     Bv32ToInt,
     IntToBv64,
     Bv64ToInt,
+    IntToBv128,
+    Bv128ToInt,
     BvUle,
     BvSle,
     BvUge,
@@ -511,7 +514,7 @@ pub enum ThyFunc {
 }
 
 impl ThyFunc {
-    pub const ALL: [ThyFunc; 44] = [
+    pub const ALL: [ThyFunc; 46] = [
         ThyFunc::StrLen,
         ThyFunc::StrConcat,
         ThyFunc::StrPrefixOf,
@@ -523,6 +526,8 @@ impl ThyFunc {
         ThyFunc::Bv32ToInt,
         ThyFunc::IntToBv64,
         ThyFunc::Bv64ToInt,
+        ThyFunc::IntToBv128,
+        ThyFunc::Bv128ToInt,
         ThyFunc::BvAdd,
         ThyFunc::BvNeg,
         ThyFunc::BvSub,
@@ -578,6 +583,8 @@ impl fmt::Display for ThyFunc {
             ThyFunc::Bv8ToInt => write!(f, "bv8_to_int"),
             ThyFunc::IntToBv64 => write!(f, "int_to_bv64"),
             ThyFunc::Bv64ToInt => write!(f, "bv64_to_int"),
+            ThyFunc::IntToBv128 => write!(f, "int_to_bv128"),
+            ThyFunc::Bv128ToInt => write!(f, "bv128_to_int"),
             ThyFunc::BvUle => write!(f, "bvule"),
             ThyFunc::BvSle => write!(f, "bvsle"),
             ThyFunc::BvUge => write!(f, "bvuge"),
@@ -626,6 +633,8 @@ impl FromStr for ThyFunc {
             "bv8_to_int" => Ok(ThyFunc::Bv8ToInt),
             "int_to_bv64" => Ok(ThyFunc::IntToBv64),
             "bv64_to_int" => Ok(ThyFunc::Bv64ToInt),
+            "int_to_bv128" => Ok(ThyFunc::IntToBv128),
+            "bv128_to_int" => Ok(ThyFunc::Bv128ToInt),
             "bvule" => Ok(ThyFunc::BvUle),
             "bvsle" => Ok(ThyFunc::BvSle),
             "bvuge" => Ok(ThyFunc::BvUge),

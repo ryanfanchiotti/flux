@@ -602,9 +602,22 @@ impl<Tag> FixpointCheckError<Tag> {
 
 pub use liquid_fixpoint::LeanStatus;
 
-/// Returns the cache key used for a function-body lean query.
+/// Returns the cache key used for a function-body lean query. It is distinct from the key of the
+/// corresponding fixpoint query, so a lean entry is never mistaken for a fixpoint result.
 pub fn lean_task_key(tcx: rustc_middle::ty::TyCtxt, def_id: DefId) -> String {
-    FixpointQueryKind::Body.task_key(tcx, def_id)
+    format!("{}###Lean", tcx.def_path_str(def_id))
+}
+
+/// Records that the lean files for the task with the given `hash` have been generated. The proof
+/// starts out as [`LeanStatus::Invalid`] and is marked as valid once it has been checked.
+pub(crate) fn record_lean_task(cache: &mut FixQueryCache, key: String, hash: u64) {
+    let result = liquid_fixpoint::VerificationResult {
+        status: FixpointStatus::Safe(Default::default()),
+        solution: vec![],
+        non_cuts_solution: vec![],
+        lean_status: LeanStatus::Invalid,
+    };
+    cache.insert(key, hash, result);
 }
 
 #[allow(unused)]
@@ -2524,12 +2537,19 @@ impl<'genv, 'tcx> ExprEncodingCtxt<'genv, 'tcx> {
     ) -> QueryResult<fixpoint::FunDef> {
         let name = *self.const_env.fun_decl_map.get(&def_id).unwrap();
         let body = self.genv.inlined_body(def_id);
-        let output = scx.sort_to_fixpoint(self.genv.func_sort(def_id).expect_mono().output());
+        let fsort = self.genv.func_sort(def_id);
+        // Only the Lean backend can emit a definition with sort parameters: the SMT encoding
+        // (`define_fun`) has no way to bind them.
+        let params = fsort.params().len();
+        if params > 0 && !matches!(self.backend, Backend::Lean) {
+            bug!("polymorphic definition `{def_id:?}` is only supported by the lean backend");
+        }
+        let output = scx.sort_to_fixpoint(fsort.skip_binders().output());
         let (args, expr) = self.body_to_fixpoint(&body, scx)?;
         let (args, inputs) = args.into_iter().unzip();
         Ok(fixpoint::FunDef {
             name,
-            sort: fixpoint::FunSort { params: 0, inputs, output },
+            sort: fixpoint::FunSort { params, inputs, output },
             body: Some(fixpoint::FunBody { args, expr }),
             comment: Some(format!("flux def: {def_id:?}")),
         })

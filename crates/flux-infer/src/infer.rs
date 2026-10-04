@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap, fmt, iter};
+use std::{cell::RefCell, fmt, iter};
 
 use flux_common::{bug, dbg, tracked_span_assert_eq, tracked_span_bug, tracked_span_dbg_assert_eq};
 use flux_config::{self as config, InferOpts, OverflowMode, RawDerefMode};
@@ -13,14 +13,15 @@ use flux_middle::{
     rty::{
         self, AliasKind, AliasTy, BaseTy, Binder, BoundReftKind, BoundVariableKinds,
         CoroutineObligPredicate, Ctor, ESpan, EVid, EarlyBinder, Expr, ExprKind, FieldProj,
-        GenericArg, GenericArgs, GenericArgsExt, HoleKind, InferMode, Lambda, List, Loc, Mutability, Name,
+        GenericArg, GenericArgsExt, HoleKind, InferMode, Lambda, List, Loc, Mutability, Name,
         NameProvenance, Path, PolyVariant, PtrKind, RefineArgs, RefineArgsExt, Region, Sort,
         SubsetTyCtor, Ty, TyCtor, TyKind, Var,
         canonicalize::{Hoister, HoisterDelegate},
         fold::TypeFoldable,
+        refining::Refiner,
     },
 };
-use flux_rustc_bridge::ToRustc;
+use flux_rustc_bridge::{ToRustc, lowering::Lower};
 use itertools::{Itertools, izip};
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_macros::extension;
@@ -313,14 +314,11 @@ pub struct InferCtxt<'infcx, 'genv, 'tcx> {
 struct InferCtxtInner {
     kvars: KVarGen,
     evars: EVarStore,
-    opaque_map: HashMap<OpaqueKey, SubsetTyCtor>,
 }
-
-pub type OpaqueKey = (DefId, GenericArgs, RefineArgs);
 
 impl InferCtxtInner {
     fn new(dummy_kvars: bool) -> Self {
-        Self { kvars: KVarGen::new(dummy_kvars), evars: Default::default(), opaque_map: HashMap::new() }
+        Self { kvars: KVarGen::new(dummy_kvars), evars: Default::default() }
     }
 }
 
@@ -394,14 +392,6 @@ impl<'infcx, 'genv, 'tcx> InferCtxt<'infcx, 'genv, 'tcx> {
     fn fresh_evar(&self) -> Expr {
         let evars = &mut self.inner.borrow_mut().evars;
         Expr::evar(evars.fresh(self.cursor.marker()))
-    }
-
-    pub fn get_opaque_ctor(&self, key: &OpaqueKey) -> Option<SubsetTyCtor> {
-        self.inner.borrow().opaque_map.get(key).cloned()
-    }
-
-    pub fn insert_opaque_ctor(&self, key: OpaqueKey, ctor: SubsetTyCtor) {
-        self.inner.borrow_mut().opaque_map.insert(key, ctor);
     }
 
     pub fn unify_exprs(&self, a: &Expr, b: &Expr) {
@@ -1027,10 +1017,22 @@ impl<'a, E: LocEnv> Sub<'a, E> {
                 // only for when concrete type on LHS and impl-with-bounds on RHS
                 self.handle_opaque_type(infcx, a, *def_id, args, refine_args)
             }
-            (BaseTy::Alias(AliasTy { kind: AliasKind::Opaque { def_id }, args, .. }), _)
+            (BaseTy::Alias(AliasTy { kind: AliasKind::Opaque { def_id }, args, refine_args }), _)
                 if opaque_reveal_eq(infcx.tcx(), *def_id, args, b) =>
             {
-                Ok(())
+                if self.reason == ConstrReason::Ret && is_own_opaque(infcx, *def_id) {
+                    // Reveal an opaque type as its hidden type, but only when checking
+                    // the return of the function defining the opaque (construction
+                    // site, where invariance forces the reverse direction, e.g.
+                    // `Token<F>` vs `Token<impl Sized>`). The value being stored *is*
+                    // the hidden value, so the reverse check is vacuous.
+                    Ok(())
+                } else {
+                    // Use site (e.g. `Call`): entail the formal's refinements from
+                    // the opaque's bounds when available, else compare the hidden
+                    // *shape* with unknown (rigid) refinements (see below).
+                    self.opaque_subtype_at_use_site(infcx, *def_id, args, refine_args, b)
+                }
             }
             (
                 BaseTy::Alias(alias_ty_a @ AliasTy { kind: AliasKind::Projection { .. }, .. }),
@@ -1098,6 +1100,21 @@ impl<'a, E: LocEnv> Sub<'a, E> {
         let (ty_a, ty_b) = match (a, b) {
             (GenericArg::Ty(ty_a), GenericArg::Ty(ty_b)) => (ty_a.clone(), ty_b.clone()),
             (GenericArg::Base(ctor_a), GenericArg::Base(ctor_b)) => {
+                // Opaque aliases don't have a meaningful sort until revealed; the
+                // `opaque <: concrete` / `concrete <: opaque` arms in `btys` handle
+                // them, so skip the sort check when either side is opaque.
+                fn is_opaque(ctor: &SubsetTyCtor) -> bool {
+                    matches!(
+                        ctor.as_bty_skipping_binder(),
+                        BaseTy::Alias(AliasTy { kind: AliasKind::Opaque { .. }, .. })
+                    )
+                }
+                if !(is_opaque(ctor_a) || is_opaque(ctor_b)) {
+                    tracked_span_dbg_assert_eq!(
+                        ctor_a.sort().erase_regions(),
+                        ctor_b.sort().erase_regions()
+                    );
+                }
                 (ctor_a.to_ty(), ctor_b.to_ty())
             }
             (GenericArg::Lifetime(_), GenericArg::Lifetime(_)) => return Ok(()),
@@ -1269,6 +1286,74 @@ impl<'a, E: LocEnv> Sub<'a, E> {
         }
         Ok(())
     }
+
+    /// Relate an opaque type on the LHS to a concrete type at a *use* site, where the
+    /// hidden value is known only through the opaque's bounds. For every projection
+    /// bound `Opaque::Assoc == term`, check `term <: formal::Assoc` (normalizing the
+    /// formal side through its impl, exactly dual to [`Sub::handle_opaque_type`]).
+    /// The caller is known to satisfy the bounds, so the formal's refinements must
+    /// follow from them; inference variables in the formal unify with bound content
+    /// instead of dangling. Opaques without projection bounds fall back to comparing
+    /// the hidden shape with unknown (rigid) refinements.
+    ///
+    /// NOTE: formal refinements not reachable through any bound assoc (e.g. extra
+    /// arguments outside all associated types under partial multi-assoc bounds) are
+    /// not examined here; covering those would require mapping bounds back into
+    /// hidden-type positions.
+    fn opaque_subtype_at_use_site(
+        &mut self,
+        infcx: &mut InferCtxt,
+        opaque_def_id: DefId,
+        opaque_args: &rty::GenericArgs,
+        opaque_refine_args: &rty::RefineArgs,
+        b: &BaseTy,
+    ) -> InferResult {
+        let bounds = infcx.genv.item_bounds(opaque_def_id)?.instantiate(
+            infcx.tcx(),
+            opaque_args,
+            opaque_refine_args,
+        );
+        let mut constrained = false;
+        for clause in &bounds {
+            if !clause.kind().vars().is_empty() {
+                Err(query_bug!("opaque use-site: clause with bound vars: `{clause:?}`"))?;
+            }
+            if let rty::ClauseKind::Projection(pred) = clause.kind_skipping_binder() {
+                constrained = true;
+                let alias_ty = pred
+                    .projection_term
+                    .with_self_ty(b.to_subset_ty_ctor())
+                    .to_alias_ty();
+                let ty_formal_assoc = BaseTy::Alias(alias_ty)
+                    .to_ty()
+                    .deeply_normalize(&mut infcx.at(self.span))?;
+                let ty_bound = pred.term.to_ty();
+                self.tys(infcx, &ty_bound, &ty_formal_assoc)?;
+            }
+        }
+        if constrained {
+            Ok(())
+        } else {
+            self.reveal_opaque_with_unknown(infcx, opaque_def_id, opaque_args, b)
+        }
+    }
+
+    fn reveal_opaque_with_unknown(
+        &mut self,
+        infcx: &mut InferCtxt,
+        opaque_def_id: DefId,
+        opaque_args: &rty::GenericArgs,
+        b: &BaseTy,
+    ) -> InferResult {
+        let Some(hidden) = rigid_hidden_for_opaque(infcx, opaque_def_id, opaque_args) else {
+            Err(query_bug!("cannot reveal opaque type `{opaque_def_id:?}`"))?
+        };
+        self.btys(infcx, &hidden, b)
+    }
+}
+
+fn is_own_opaque(infcx: &InferCtxt, opaque_def_id: DefId) -> bool {
+    infcx.tcx().parent(opaque_def_id) == infcx.def_id
 }
 
 fn opaque_reveal_eq(
@@ -1284,6 +1369,40 @@ fn opaque_reveal_eq(
         .skip_normalization();
     let other = other.to_rustc(tcx);
     tcx.erase_and_anonymize_regions(hidden) == tcx.erase_and_anonymize_regions(other)
+}
+
+/// Compute the hidden type of an opaque using *unknown* refinements: predicates become
+/// `true` (assume nothing) and indices become rigid variables (must hold for all values).
+/// Comparing against this instead of the erased hidden type keeps inference variables
+/// in the other side solvable while failing cleanly wherever a concrete refinement is
+/// required.
+fn rigid_hidden_for_opaque(
+    infcx: &mut InferCtxt,
+    opaque_def_id: DefId,
+    opaque_args: &rty::GenericArgs,
+) -> Option<BaseTy> {
+    let genv = infcx.genv;
+    let tcx = genv.tcx();
+    let hidden_rustc = tcx
+        .type_of(opaque_def_id)
+        .instantiate(tcx, opaque_args.to_rustc(tcx))
+        .skip_normalization();
+    let hidden_bridge = hidden_rustc.lower(tcx).ok()?;
+    let refiner = Refiner::with_holes(genv, infcx.def_id).ok()?;
+    let ty_or_base = refiner.refine_ty_or_base(&hidden_bridge).ok()?;
+    let ctor = match ty_or_base {
+        rty::TyOrBase::Base(ctor) => ctor,
+        rty::TyOrBase::Ty(ty) => {
+            ty.shallow_canonicalize().as_ty_or_base().as_base()?
+        }
+    };
+    let ctor = ctor.replace_holes(|_, kind| match kind {
+        rty::HoleKind::Pred => Expr::tt(),
+        rty::HoleKind::Expr(sort) => {
+            Expr::fvar(infcx.define_bound_reft_var(&sort, BoundReftKind::Anon))
+        }
+    });
+    Some(ctor.as_bty_skipping_binder().clone())
 }
 
 fn mk_coroutine_obligations(

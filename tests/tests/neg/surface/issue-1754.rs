@@ -39,15 +39,31 @@ fn id<T>(x: T) -> T {
 
 #[flux::spec(fn(n: i32) -> impl Tr<Out = i32{v: v >= n}>)]
 pub fn test_rec_id(n: i32) -> impl Tr<Out = i32> {
-    if n > 0 {
-        return id::<Wrap<i32>>(test_rec_id(n - 10)); //~ ERROR refinement type
+    if n > 0 { 
+        return id::<Wrap<i32>>(test_rec_id(n - 10));
     }
     Wrap(n)
-}
+} //~ ERROR refinement type
 
 #[flux::sig(fn(i32{v: v >= 5}))]
 fn requires_ge5(_x: i32) {}
 
+#[flux::sig(fn(i32{v: v < 5}))]
+fn requires_lt5(_x: i32) {}
+
 pub fn client() {
-    requires_ge5(test_rec_id(5).get()); //~ ERROR refinement type
+    requires_ge5(test_rec_id(5).get());
+    requires_lt5(test_rec_id(5).get()); //~ ERROR refinement type
 }
+
+#[flux::sig(fn(n: i32, x: Wrap<i32{v: v >= n}>))]
+fn takes_exact(_n: i32, _x: Wrap<i32>) {}
+
+#[flux::spec(fn(n: i32) -> impl Tr<Out = i32{v: v >= n}>)]
+pub fn test_rec_bound_bad(n: i32) -> impl Tr<Out = i32> {
+    if n > 0 {
+        takes_exact(n, test_rec_bound_bad(n - 1)); //~ ERROR refinement type
+    }
+    Wrap(n)
+}
+

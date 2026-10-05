@@ -67,3 +67,75 @@ pub fn test_rec_bound_bad(n: i32) -> impl Tr<Out = i32> {
     Wrap(n)
 }
 
+#[flux::spec(fn(n: i32) -> impl Tr<Out = i32{v: v >= n}>)]
+pub fn test_rec_direct_bad(n: i32) -> impl Tr<Out = i32> {
+    if n > 0 {
+        return test_rec_direct_bad(n - 10);
+    }
+    Wrap(n)
+} //~ ERROR refinement type
+
+#[flux::spec(fn(n: i32) -> impl Tr<Out = i32{v: v >= n}>)]
+pub fn test_rec_inferred_bad(n: i32) -> impl Tr<Out = i32> {
+    if n > 0 {
+        return id(test_rec_inferred_bad(n - 10));
+    }
+    Wrap(n)
+} //~ ERROR refinement type
+
+pub struct W2<T, U>(T, U);
+
+impl<T, U> Tr for W2<T, U> {
+    type Out = T;
+    fn get(self) -> T {
+        self.0
+    }
+}
+
+#[flux::sig(fn(W2<i32, i32{v: v == 0}>))]
+fn takes_tagged(_x: W2<i32, i32>) {}
+
+#[flux::spec(fn(n: i32) -> impl Tr<Out = i32{v: v >= n}>)]
+pub fn test_rec_tag_bad(n: i32) -> impl Tr<Out = i32> {
+    if n > 0 {
+        takes_tagged(test_rec_tag_bad(n - 1)); //~ ERROR refinement type
+    }
+    W2(n, 5)
+}
+
+#[flux::spec(fn(n: i32) -> impl Tr<Out = i32{v: v >= n}>)]
+pub fn test_rec_closure_bad(n: i32) -> impl Tr<Out = i32> {
+    let f = || takes_tagged(test_rec_closure_bad(n - 1)); //~ ERROR refinement type
+    if n > 0 {
+        f();
+    }
+    W2(n, 5)
+}
+
+pub struct P<T, U>(T, U);
+
+pub trait Tr2 {
+    type A;
+    type B;
+    fn get_a(self) -> Self::A;
+}
+
+impl<T, U> Tr2 for P<T, U> {
+    type A = T;
+    type B = U;
+    fn get_a(self) -> T {
+        self.0
+    }
+}
+
+#[flux::sig(fn(P<i32, i32{v: v == 0}>))]
+fn takes_p(_x: P<i32, i32>) {}
+
+#[flux::spec(fn(n: i32) -> impl Tr2<A = i32{v: v >= n}>)]
+pub fn test_rec_multi_bad(n: i32) -> impl Tr2<A = i32> {
+    if n > 0 {
+        takes_p(test_rec_multi_bad(n - 1)); //~ ERROR refinement type
+    }
+    P(n, 5)
+}
+

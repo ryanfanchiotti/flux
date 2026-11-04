@@ -4,10 +4,10 @@
     // The memory range [addr, addr + num_bytes) is entirely contained within
     // the pointer's allocation. In our model this is: addr >= base (not before
     // the start) and num_bytes <= size (num_bytes remaining bytes fit before
-    // the end). The `size >= 0` guard rules out pointers already past the end.
+    // the end).
     // See: https://doc.rust-lang.org/std/ptr/index.html#safety
     fn dereferenceable(p: ptr, num_bytes: int) -> bool {
-        p.addr >= p.base && num_bytes <= p.size && p.size >= 0
+        p.addr >= p.base && num_bytes <= p.size
     }
 
     // Non-null and dereferenceable for `num_bytes` bytes. This is the strict
